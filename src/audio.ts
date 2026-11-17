@@ -26,6 +26,28 @@ export type EditAudioOptions = Pick<
 
 type LayerWithAudio = (AudioLayer | VideoLayer) & { speedFactor: number };
 
+// ffmpeg `amix` scales each input down by 1/input-count by default (normalize=1),
+// which makes the rendered level depend on how many tracks happen to be active and
+// causes audible volume jumps when tracks start/stop. We always want a plain sum,
+// weighted by the user-configured mixVolume.
+const AMIX_NORMALIZE = 0;
+
+// Equal-power cross fade: outgoing gain cos(pi/2*p), incoming gain sin(pi/2*p),
+// so g1^2 + g2^2 = 1 throughout the overlap and the total energy stays constant
+// (ffmpeg's `qsin` curve implements exactly these gain ramps).
+const DEFAULT_AUDIO_OUT_CURVE = "qsin";
+const DEFAULT_AUDIO_IN_CURVE = "qsin";
+
+// Sample rate that every input is converted to before any mixing/cross-fading,
+// so inputs with differing sample rates are unified on a common clock first.
+const MIX_SAMPLE_RATE = 48000;
+
+function parseVolume(volume: number | string | undefined, fallback = 1): number {
+  if (volume == null || volume === "") return fallback;
+  const parsed = typeof volume === "number" ? volume : Number.parseFloat(volume);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
 export default ({ verbose, tmpDir }: AudioOptions) => {
   async function createMixedAudioClips({
     clips,
@@ -49,11 +71,13 @@ export default ({ verbose, tmpDir }: AudioOptions) => {
               "-f",
               "lavfi",
               "-i",
-              "anullsrc=channel_layout=stereo:sample_rate=44100",
+              `anullsrc=channel_layout=stereo:sample_rate=${MIX_SAMPLE_RATE}`,
               "-sample_fmt",
               "s32",
               "-ar",
-              "48000",
+              MIX_SAMPLE_RATE.toString(),
+              "-ac",
+              "2",
               "-t",
               duration!.toString(),
               "-c:a",
@@ -107,6 +131,14 @@ export default ({ verbose, tmpDir }: AudioOptions) => {
 
                 const cutToArg = (cutTo! - cutFrom!) * speedFactor;
 
+                // Unify sample rate and channel layout before any later mixing,
+                // so layers extracted from sources with differing formats share a clock.
+                const formatFilters = [
+                  ...(atempoFilter ? [atempoFilter] : []),
+                  `aresample=${MIX_SAMPLE_RATE}`,
+                  "aformat=channel_layouts=stereo",
+                ];
+
                 const args = [
                   "-nostdin",
                   ...getCutFromArgs({ cutFrom }),
@@ -117,12 +149,15 @@ export default ({ verbose, tmpDir }: AudioOptions) => {
                   "-sample_fmt",
                   "s32",
                   "-ar",
-                  "48000",
+                  MIX_SAMPLE_RATE.toString(),
+                  "-ac",
+                  "2",
                   "-map",
                   "a:0",
                   "-c:a",
                   "flac",
-                  ...(atempoFilter ? ["-filter:a", atempoFilter] : []),
+                  "-filter:a",
+                  formatFilters.join(","),
                   "-y",
                   layerAudioPath,
                 ];
@@ -148,13 +183,21 @@ export default ({ verbose, tmpDir }: AudioOptions) => {
           if (processedAudioLayers.length === 1)
             return { clipAudioPath: processedAudioLayers[0][0], silent: false };
 
-          // Merge/mix all layers' audio
-          const weights = processedAudioLayers.map(([, { mixVolume }]) => mixVolume ?? 1);
+          // Merge/mix all layers' audio.
+          // All layer audio was decoded to a common sample rate (MIX_SAMPLE_RATE) above,
+          // so inputs with differing source sample rates are unified before mixing.
+          // normalize=0 keeps the weighted sum at its true level instead of dividing
+          // by the number of inputs (which would make the volume depend on track count).
+          const weights = processedAudioLayers.map(([, { mixVolume }]) => parseVolume(mixVolume));
           const args = [
             "-nostdin",
             ...flatMap(processedAudioLayers, ([layerAudioPath]) => ["-i", layerAudioPath]),
             "-filter_complex",
-            `amix=inputs=${processedAudioLayers.length}:duration=longest:weights=${weights.join(" ")}`,
+            `amix=inputs=${processedAudioLayers.length}:duration=longest:normalize=${AMIX_NORMALIZE}:weights=${weights.join(" ")}`,
+            "-ar",
+            MIX_SAMPLE_RATE.toString(),
+            "-ac",
+            "2",
             "-c:a",
             "flac",
             "-y",
@@ -192,27 +235,55 @@ export default ({ verbose, tmpDir }: AudioOptions) => {
         clipAudio.map(({ path }) => basename(path)),
       );
 
-    let inStream = "[0:a]";
-    const filterGraph = clipAudio
-      .slice(0, -1)
-      .map(({ transition }, i) => {
-        const outStream = `[concat${i}]`;
+    // Build the filter graph as a chain. Each join is either:
+    // - a hard `concat` when there is no transition (duration 0), so no audio is
+    //   overlapped/faded and the boundary lands exactly where config says it does, or
+    // - an `acrossfade` overlapping the end of the previous result with the next clip
+    //   for exactly transition.duration, using equal-power (qsin) gain ramps by default.
+    //
+    // Every intermediate result gets an explicit named label ([ac0], [ac1], ...).
+    // Relying on ffmpeg's positional stream labels (as the previous implementation did)
+    // does not work once other filters (e.g. concat) are part of the graph.
+    const filterParts: string[] = [];
+    // Bare label name; the initial input is addressed by its ffmpeg stream specifier.
+    let prevLabel = "0:a";
+    const joinCount = clipAudio.length - 1;
 
-        const epsilon = 0.0001; // If duration is 0, ffmpeg seems to default to 1 sec instead, hence epsilon.
-        let ret = `${inStream}[${i + 1}:a]acrossfade=d=${Math.max(epsilon, transition?.duration ?? 0)}:c1=${transition?.audioOutCurve ?? "tri"}:c2=${transition?.audioInCurve ?? "tri"}`;
+    // The transition at the boundary between clip i and clip i+1 is configured
+    // on the outgoing clip i (matching how parseConfig assigns it).
+    clipAudio.slice(0, -1).forEach(({ transition }, i) => {
+      const inputIndex = i + 1;
+      // The last filter's output is the graph output: leave it unlabeled so
+      // ffmpeg connects it to the output file automatically.
+      const nextLabel = i < joinCount - 1 ? `ac${i}` : "";
+      const duration = transition?.duration ?? 0;
+      const outputLabel = nextLabel ? `[${nextLabel}]` : "";
 
-        inStream = outStream;
+      if (!(duration > 0)) {
+        // Hard cut: splice the two streams without fading or losing any samples.
+        filterParts.push(`[${prevLabel}][${inputIndex}:a]concat=n=2:v=0:a=1${outputLabel}`);
+      } else {
+        const outCurve = transition?.audioOutCurve || DEFAULT_AUDIO_OUT_CURVE;
+        const inCurve = transition?.audioInCurve || DEFAULT_AUDIO_IN_CURVE;
+        filterParts.push(
+          `[${prevLabel}][${inputIndex}:a]acrossfade=d=${duration}:c1=${outCurve}:c2=${inCurve}${outputLabel}`,
+        );
+      }
 
-        if (i < clipAudio.length - 2) ret += outStream;
-        return ret;
-      })
-      .join(",");
+      if (nextLabel) prevLabel = nextLabel;
+    });
+
+    const filterGraph = filterParts.join(";");
 
     const args = [
       "-nostdin",
       ...flatMap(clipAudio, ({ path }) => ["-i", path]),
       "-filter_complex",
       filterGraph,
+      "-ar",
+      MIX_SAMPLE_RATE.toString(),
+      "-ac",
+      "2",
       "-c",
       "flac",
       "-y",
@@ -241,19 +312,24 @@ export default ({ verbose, tmpDir }: AudioOptions) => {
     }
     const enableAudioNorm = audioNorm && audioNorm.enable;
 
+    // First unify every input onto the same sample rate/channel layout
+    // (a trim/delay/pad chain does not resample), so tracks recorded at different
+    // sample rates are clock-aligned before they are summed.
     // https://stackoverflow.com/questions/35509147/ffmpeg-amix-filter-volume-issue-with-inputs-of-different-duration
     let filterComplex = streams
       .map(({ start, cutFrom, cutTo }, i) => {
         const cutToArg = cutTo != null ? `:end=${cutTo}` : "";
         const apadArg = i > 0 ? ",apad" : ""; // Don't pad the first track (audio from video clips with correct duration)
 
-        return `[${i}:a]atrim=start=${cutFrom || 0}${cutToArg},adelay=delays=${Math.floor((start || 0) * 1000)}:all=1${apadArg}[a${i}]`;
+        return `[${i}:a]aresample=${MIX_SAMPLE_RATE},aformat=channel_layouts=stereo,atrim=start=${cutFrom || 0}${cutToArg},adelay=delays=${Math.floor((start || 0) * 1000)}:all=1${apadArg}[a${i}]`;
       })
       .join(";");
 
     const volumeArg = outputVolume != null ? `,volume=${outputVolume}` : "";
     const audioNormArg = enableAudioNorm ? `,dynaudnorm=g=${gaussSize}:maxgain=${maxGain}` : "";
-    filterComplex += `;${streams.map((_, i) => `[a${i}]`).join("")}amix=inputs=${streams.length}:duration=first:dropout_transition=0:weights=${streams.map((s) => (s.mixVolume != null ? s.mixVolume : 1)).join(" ")}${audioNormArg}${volumeArg}`;
+    // normalize=0: plain weighted sum so the configured mixVolume values define the
+    // envelope instead of ffmpeg re-scaling everything by the active input count.
+    filterComplex += `;${streams.map((_, i) => `[a${i}]`).join("")}amix=inputs=${streams.length}:duration=first:dropout_transition=0:normalize=${AMIX_NORMALIZE}:weights=${streams.map((s) => parseVolume(s.mixVolume)).join(" ")}${audioNormArg}${volumeArg}`;
 
     const mixedAudioPath = join(tmpDir, "audio-mixed.flac");
 
@@ -263,6 +339,10 @@ export default ({ verbose, tmpDir }: AudioOptions) => {
       "-vn",
       "-filter_complex",
       filterComplex,
+      "-ar",
+      MIX_SAMPLE_RATE.toString(),
+      "-ac",
+      "2",
       "-c:a",
       "flac",
       "-y",
