@@ -1,6 +1,7 @@
 import { ExecaError } from "execa";
 import * as fabric from "fabric/node";
 import { defineFrameSource } from "../api/index.js";
+import { createLogCapture, withErrorContext } from "../errors.js";
 import { ffmpeg, readFileStreams } from "../ffmpeg.js";
 import { rawVideoToFrames } from "../transforms/rawVideoToFrames.js";
 import type { VideoLayer } from "../types.js";
@@ -128,28 +129,52 @@ export default defineFrameSource<VideoLayer>("video", async (options) => {
     channels,
     signal: controller.signal,
   });
+  const stderrCapture = createLogCapture();
   const ps = ffmpeg(args, {
     encoding: "buffer",
     buffer: false,
     stdin: "ignore",
     stdout: { transform },
-    stderr: process.stderr,
+    stderr: "pipe",
     // ffmpeg doesn't like to stop, force it
     forceKillAfterDelay: 1000,
     cancelSignal: controller.signal,
   });
+  ps.stderr?.on("data", stderrCapture.handleData);
 
-  // Ignore errors if the process is aborted
+  // Don't let process errors become unhandled rejections;
+  // they are re-thrown (with context) when reading frames instead
+  let processError: ExecaError | undefined;
   ps.catch((err: ExecaError) => {
-    if (!err.isCanceled) throw err;
-    if (verbose) console.log("ffmpeg process aborted", path);
+    if (err.isCanceled) {
+      if (verbose) console.log("ffmpeg process aborted", path);
+      return;
+    }
+    processError = err;
   });
 
   // Convert process to iterator to fetch frame data
   const iterator = ps.iterable();
 
   async function readNextFrame(progress: number, canvas: fabric.StaticCanvas, time: number) {
-    const { value: rgba, done } = await iterator.next();
+    if (processError)
+      throw withErrorContext(
+        processError,
+        `Failed to extract frames from video ${path}`,
+        stderrCapture.getCaptured(),
+      );
+
+    let next: Awaited<ReturnType<typeof iterator.next>>;
+    try {
+      next = await iterator.next();
+    } catch (err) {
+      throw withErrorContext(
+        err,
+        `Failed to extract frames from video ${path}`,
+        stderrCapture.getCaptured(),
+      );
+    }
+    const { value: rgba, done } = next;
 
     if (done) {
       if (verbose) console.log(path, "ffmpeg video stream ended");

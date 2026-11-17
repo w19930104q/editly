@@ -2,7 +2,7 @@ import { flatMap } from "lodash-es";
 import pMap from "p-map";
 import { basename, join, resolve } from "path";
 import type { Configuration } from "./configuration.js";
-import { ffmpeg, getCutFromArgs, readFileStreams } from "./ffmpeg.js";
+import { getCutFromArgs, readFileStreams, runFfmpeg } from "./ffmpeg.js";
 import type { TransitionOptions } from "./transition.js";
 import type {
   AudioLayer,
@@ -61,7 +61,7 @@ export default ({ verbose, tmpDir }: AudioOptions) => {
               "-y",
               clipAudioPath,
             ];
-            await ffmpeg(args);
+            await runFfmpeg(args, `Creating silent audio for clip ${i}`);
 
             return { silent: true, clipAudioPath };
           }
@@ -127,7 +127,7 @@ export default ({ verbose, tmpDir }: AudioOptions) => {
                   layerAudioPath,
                 ];
 
-                await ffmpeg(args);
+                await runFfmpeg(args, `Extracting audio from ${path} (clip ${i}, layer ${j})`);
 
                 return [layerAudioPath, audioLayer];
               } catch (err) {
@@ -161,7 +161,7 @@ export default ({ verbose, tmpDir }: AudioOptions) => {
             clipAudioPath,
           ];
 
-          await ffmpeg(args);
+          await runFfmpeg(args, `Mixing audio layers of clip ${i}`);
           return { clipAudioPath, silent: false };
         }
 
@@ -218,7 +218,7 @@ export default ({ verbose, tmpDir }: AudioOptions) => {
       "-y",
       outPath,
     ];
-    await ffmpeg(args);
+    await runFfmpeg(args, `Concatenating audio of ${clipAudio.length} clips`);
 
     return outPath;
   }
@@ -269,7 +269,7 @@ export default ({ verbose, tmpDir }: AudioOptions) => {
       mixedAudioPath,
     ];
 
-    await ffmpeg(args);
+    await runFfmpeg(args, `Mixing ${streams.length} audio tracks`);
 
     return mixedAudioPath;
   }

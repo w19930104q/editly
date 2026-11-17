@@ -8,7 +8,11 @@ import ndarray from "ndarray";
 import type { EasingFunction } from "./easings.js";
 import * as easings from "./easings.js";
 
-const { default: createTransition } = glTransition;
+// CJS/ESM interop: when bundled, the default import is `{ default: createTransition }`,
+// but unbundled (vitest/tsx) it is already the function itself
+const createTransition = (
+  typeof glTransition === "function" ? glTransition : glTransition.default
+) as typeof glTransition.default;
 
 const TransitionAliases: Record<string, Partial<TransitionOptions>> = {
   "directional-left": { name: "directional", easing: "easeOutExpo", params: { direction: [1, 0] } },

@@ -3,6 +3,7 @@ import { compareVersions } from "compare-versions";
 import { execa, type Options } from "execa";
 import fsExtra from "fs-extra";
 import { FfmpegConfig } from "./configuration.js";
+import { withErrorContext } from "./errors.js";
 
 export type Stream = {
   codec_type: string;
@@ -79,6 +80,18 @@ export function ffmpeg(args: string[], options?: Options) {
   return execa(config.ffmpegPath, [...getFfmpegCommonArgs(), ...args], options);
 }
 
+/**
+ * Runs ffmpeg and, on failure, throws an error that includes the given
+ * context (which stage/file) plus the tail of the ffmpeg log.
+ */
+export async function runFfmpeg(args: string[], context: string, options?: Options) {
+  try {
+    return await ffmpeg(args, options);
+  } catch (err) {
+    throw withErrorContext(err, context);
+  }
+}
+
 export function ffprobe(args: string[]) {
   return execa(config.ffprobePath, args);
 }
@@ -94,22 +107,32 @@ export function parseFps(fps?: string) {
 }
 
 export async function readDuration(p: string) {
-  const { stdout } = await ffprobe([
-    "-v",
-    "error",
-    "-show_entries",
-    "format=duration",
-    "-of",
-    "default=noprint_wrappers=1:nokey=1",
-    p,
-  ]);
+  let stdout: string;
+  try {
+    ({ stdout } = await ffprobe([
+      "-v",
+      "error",
+      "-show_entries",
+      "format=duration",
+      "-of",
+      "default=noprint_wrappers=1:nokey=1",
+      p,
+    ]));
+  } catch (err) {
+    throw withErrorContext(err, `Failed to read duration of ${p}`);
+  }
   const parsed = parseFloat(stdout);
-  assert(!Number.isNaN(parsed));
+  assert(!Number.isNaN(parsed), `Could not parse duration of ${p}`);
   return parsed;
 }
 
 export async function readFileStreams(p: string) {
-  const { stdout } = await ffprobe(["-show_entries", "stream", "-of", "json", p]);
+  let stdout: string;
+  try {
+    ({ stdout } = await ffprobe(["-show_entries", "stream", "-of", "json", p]));
+  } catch (err) {
+    throw withErrorContext(err, `Failed to read streams of ${p}`);
+  }
   return JSON.parse(stdout).streams as Stream[];
 }
 

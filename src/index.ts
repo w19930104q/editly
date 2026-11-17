@@ -5,6 +5,7 @@ import JSON5 from "json5";
 
 import Audio from "./audio.js";
 import { Configuration, type ConfigurationOptions } from "./configuration.js";
+import { createLogCapture, withErrorContext } from "./errors.js";
 import { configureFf, ffmpeg, parseFps } from "./ffmpeg.js";
 import { createFrameSource } from "./frameSource.js";
 import parseConfig, { ProcessedClip } from "./parseConfig.js";
@@ -71,18 +72,35 @@ async function Editly(input: ConfigurationOptions): Promise<void> {
   if (verbose) console.log({ tmpDir });
   await fsExtra.mkdirp(tmpDir);
 
+  // If the output file already exists, we must not delete it on failure (it belongs to the user)
+  const outPathExistedBefore = await fsExtra.pathExists(outPath);
+  let succeeded = false;
+
+  // Removes any temporary files created by this run (but never the user's input assets)
+  const cleanup = async () => {
+    if (!keepTmp) await fsExtra.remove(tmpDir);
+    // Remove a half-written output file, unless it existed before we started
+    if (!succeeded && !outPathExistedBefore) await fsExtra.remove(outPath);
+  };
+
   const { editAudio } = Audio({ verbose, tmpDir });
 
-  const audioFilePath = !isGif
-    ? await editAudio({
-        keepSourceAudio,
-        arbitraryAudio,
-        clipsAudioVolume,
-        clips,
-        audioNorm,
-        outputVolume,
-      })
-    : undefined;
+  let audioFilePath: string | undefined;
+  try {
+    audioFilePath = !isGif
+      ? await editAudio({
+          keepSourceAudio,
+          arbitraryAudio,
+          clipsAudioVolume,
+          clips,
+          audioNorm,
+          outputVolume,
+        })
+      : undefined;
+  } catch (err) {
+    await cleanup();
+    throw withErrorContext(err, "Audio processing failed");
+  }
 
   // Try to detect parameters from first video
   let firstVideoWidth;
@@ -251,12 +269,15 @@ async function Editly(input: ConfigurationOptions): Promise<void> {
       buffer: false,
       stdin: "pipe",
       stdout: process.stdout,
-      stderr: process.stderr,
+      stderr: "pipe",
     });
   }
 
   let outProcess: ResultPromise<Options> | undefined;
   let outProcessExitCode;
+
+  // Tee the output ffmpeg's stderr, so we can include its tail in error messages
+  const outProcessLog = createLogCapture();
 
   let frameSource1;
   let frameSource2;
@@ -292,6 +313,7 @@ async function Editly(input: ConfigurationOptions): Promise<void> {
   try {
     try {
       outProcess = startFfmpegWriterProcess();
+      outProcess.stderr?.on("data", outProcessLog.handleData);
 
       let outProcessError;
 
@@ -453,7 +475,10 @@ async function Editly(input: ConfigurationOptions): Promise<void> {
       outProcess.stdin?.end();
     } catch (err) {
       outProcess?.kill();
-      throw err;
+      throw withErrorContext(
+        err,
+        `Rendering failed (clip ${transitionFromClipId}, frame ${totalFramesWritten})`,
+      );
     } finally {
       if (verbose) console.log("Cleanup");
       if (frameSource1) await frameSource1.close();
@@ -465,10 +490,13 @@ async function Editly(input: ConfigurationOptions): Promise<void> {
       await outProcess;
     } catch (err) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      if (outProcessExitCode !== 0 && !(err as any).isTerminated) throw err;
+      if (outProcessExitCode !== 0 && !(err as any).isTerminated)
+        throw withErrorContext(err, "Encoding output video failed", outProcessLog.getCaptured());
     }
+
+    succeeded = true;
   } finally {
-    if (!keepTmp) await fsExtra.remove(tmpDir);
+    await cleanup();
   }
 
   console.log();
