@@ -9,6 +9,7 @@ import { configureFf, ffmpeg, parseFps } from "./ffmpeg.js";
 import { createFrameSource } from "./frameSource.js";
 import parseConfig, { ProcessedClip } from "./parseConfig.js";
 import { createFabricCanvas, rgbaToFabricImage } from "./sources/fabric.js";
+import { computeTimeline, generateFrameSchedule, getSafeTransitionDuration } from "./timeline.js";
 import type { RenderSingleFrameConfig } from "./types.js";
 import { assertFileValid, multipleOf2 } from "./util.js";
 
@@ -57,7 +58,7 @@ async function Editly(input: ConfigurationOptions): Promise<void> {
 
   if (verbose) console.log(JSON5.stringify(config, null, 2));
 
-  const { clips, arbitraryAudio } = await parseConfig({
+  const { clips, arbitraryAudio: arbitraryAudioBase, detachedAudio } = await parseConfig({
     clips: clipsIn,
     arbitraryAudio: arbitraryAudioIn,
     backgroundAudioPath,
@@ -66,23 +67,9 @@ async function Editly(input: ConfigurationOptions): Promise<void> {
     allowRemoteRequests,
     defaults,
   });
-  if (verbose) console.log("Calculated", JSON5.stringify({ clips, arbitraryAudio }, null, 2));
 
   if (verbose) console.log({ tmpDir });
   await fsExtra.mkdirp(tmpDir);
-
-  const { editAudio } = Audio({ verbose, tmpDir });
-
-  const audioFilePath = !isGif
-    ? await editAudio({
-        keepSourceAudio,
-        arbitraryAudio,
-        clipsAudioVolume,
-        clips,
-        audioNorm,
-        outputVolume,
-      })
-    : undefined;
 
   // Try to detect parameters from first video
   let firstVideoWidth;
@@ -179,13 +166,49 @@ async function Editly(input: ConfigurationOptions): Promise<void> {
 
   console.log(`${width}x${height} ${fps}fps`);
 
-  const estimatedTotalFrames =
-    fps *
-    clips.reduce((acc, c, i) => {
-      let newAcc = acc + c.duration;
-      if (i !== clips.length - 1) newAcc -= c.transition.duration;
-      return newAcc;
-    }, 0);
+  // Compute the frame-exact timeline. All transition clamping/rounding happens here,
+  // in the frame domain, so that video frames, audio crossfades and detached audio
+  // offsets all agree exactly.
+  const timeline = computeTimeline(
+    clips.map((clip) => ({
+      duration: clip.duration,
+      transitionDuration: clip.transition.duration,
+    })),
+    fps,
+  );
+
+  // Quantize transition durations to whole frames, so that the audio crossfades
+  // (which are specified in seconds) match the video transitions exactly.
+  clips.forEach((clip, i) => {
+    clip.transition.duration = timeline.clips[i].transitionNumFrames / fps;
+  });
+
+  // Now that the timeline is final, we know exactly where each clip starts on the
+  // output timeline, so we can place the detached audio tracks.
+  const arbitraryAudio = [
+    ...arbitraryAudioBase,
+    ...detachedAudio.map(({ clipIndex, track }) => ({
+      ...track,
+      start: timeline.clips[clipIndex].startFrame / fps + (track.start ?? 0),
+    })),
+  ];
+
+  if (verbose) console.log("Calculated", JSON5.stringify({ clips, arbitraryAudio }, null, 2));
+
+  const { editAudio } = Audio({ verbose, tmpDir });
+
+  const audioFilePath = !isGif
+    ? await editAudio({
+        keepSourceAudio,
+        arbitraryAudio,
+        clipsAudioVolume,
+        clips,
+        audioNorm,
+        outputVolume,
+      })
+    : undefined;
+
+  const estimatedTotalFrames = timeline.totalFrames;
 
   function getOutputArgs() {
     if (customOutputArgs) {
@@ -258,20 +281,17 @@ async function Editly(input: ConfigurationOptions): Promise<void> {
   let outProcess: ResultPromise<Options> | undefined;
   let outProcessExitCode;
 
-  let frameSource1;
-  let frameSource2;
+  type ClipFrameSource = Awaited<ReturnType<typeof createFrameSource>>;
 
-  let frameSource1Data;
+  let frameSource1: ClipFrameSource | undefined;
+  let frameSource2: ClipFrameSource | undefined;
+
+  let frameSource1Data: Buffer | undefined;
 
   let totalFramesWritten = 0;
-  let fromClipFrameAt = 0;
-  let toClipFrameAt = 0;
 
-  let transitionFromClipId = 0;
-
-  const getTransitionToClipId = () => transitionFromClipId + 1;
-  const getTransitionFromClip = () => clips[transitionFromClipId];
-  const getTransitionToClip = () => clips[getTransitionToClipId()];
+  // Index of the clip that frameSource1 is currently reading
+  let currentClipIndex = 0;
 
   const getSource = async (clip: ProcessedClip, clipIndex: number) =>
     createFrameSource({
@@ -284,10 +304,6 @@ async function Editly(input: ConfigurationOptions): Promise<void> {
       logTimes,
       framerateStr,
     });
-  const getTransitionFromSource = async () =>
-    getSource(getTransitionFromClip(), transitionFromClipId);
-  const getTransitionToSource = async () =>
-    getTransitionToClip() && getSource(getTransitionToClip(), getTransitionToClipId());
 
   try {
     try {
@@ -306,35 +322,34 @@ async function Editly(input: ConfigurationOptions): Promise<void> {
         outProcessError = err;
       });
 
-      frameSource1 = await getTransitionFromSource();
-      frameSource2 = await getTransitionToSource();
+      frameSource1 = await getSource(clips[0], 0);
+      frameSource2 = clips[1] ? await getSource(clips[1], 1) : undefined;
 
-      while (!outProcessError) {
-        const transitionToClip = getTransitionToClip();
-        const transitionFromClip = getTransitionFromClip();
-        const fromClipNumFrames = Math.round(transitionFromClip.duration * fps);
-        const toClipNumFrames = transitionToClip && Math.round(transitionToClip.duration * fps);
-        const fromClipProgress = fromClipFrameAt / fromClipNumFrames;
-        const toClipProgress = transitionToClip && toClipFrameAt / toClipNumFrames;
-        const fromClipTime = transitionFromClip.duration * fromClipProgress;
-        const toClipTime = transitionToClip && transitionToClip.duration * toClipProgress;
+      let runTransitionOnFrame: ReturnType<ProcessedClip["transition"]["create"]> | undefined;
 
-        const currentTransition = transitionFromClip.transition;
-        const transitionNumFrames = Math.round(currentTransition.duration * fps);
-        const runTransitionOnFrame = currentTransition.create({ width, height, channels });
+      // The frame schedule tells us exactly which clip frame(s) each output frame
+      // consists of, so the rendered timeline matches the configuration exactly.
+      for (const frame of generateFrameSchedule(timeline.clips)) {
+        if (outProcessError) break;
 
-        // Each clip has two transitions, make sure we leave enough room:
-        const transitionNumFramesSafe = Math.floor(
-          Math.min(
-            Math.min(
-              fromClipNumFrames,
-              toClipNumFrames != null ? toClipNumFrames : Number.MAX_SAFE_INTEGER,
-            ) / 2,
-            transitionNumFrames,
-          ),
-        );
-        // How many frames into the transition are we? negative means not yet started
-        const transitionFrameAt = fromClipFrameAt - (fromClipNumFrames - transitionNumFramesSafe);
+        // Moved on to the next clip? (Can advance by more than one if a clip
+        // renders zero frames)
+        while (frame.fromClipIndex !== currentClipIndex) {
+          currentClipIndex += 1;
+          console.log(
+            `Done with transition, switching to next transitionFromClip (${currentClipIndex})`,
+          );
+
+          // Cleanup completed frameSource1, swap and load next frameSource2
+          await frameSource1!.close();
+          frameSource1 = frameSource2;
+          const nextClip = clips[currentClipIndex + 1];
+          frameSource2 = nextClip ? await getSource(nextClip, currentClipIndex + 1) : undefined;
+
+          runTransitionOnFrame = undefined;
+        }
+
+        const currentTransition = clips[currentClipIndex].transition;
 
         if (!verbose) {
           const percentDone = Math.floor(100 * (totalFramesWritten / estimatedTotalFrames));
@@ -342,53 +357,34 @@ async function Editly(input: ConfigurationOptions): Promise<void> {
             process.stdout.write(`${String(percentDone).padStart(3, " ")}% `);
         }
 
-        // console.log({ transitionFrameAt, transitionNumFramesSafe })
-        // const transitionLastFrameIndex = transitionNumFramesSafe - 1;
-        const transitionLastFrameIndex = transitionNumFramesSafe;
-
-        // Done with transition?
-        if (transitionFrameAt >= transitionLastFrameIndex) {
-          transitionFromClipId += 1;
-          console.log(
-            `Done with transition, switching to next transitionFromClip (${transitionFromClipId})`,
-          );
-
-          if (!getTransitionFromClip()) {
-            console.log("No more transitionFromClip, done");
-            break;
-          }
-
-          // Cleanup completed frameSource1, swap and load next frameSource2
-          await frameSource1.close();
-          frameSource1 = frameSource2;
-          frameSource2 = await getTransitionToSource();
-
-          fromClipFrameAt = transitionLastFrameIndex;
-          toClipFrameAt = 0;
-
-          continue;
-        }
+        // Frame-local time is derived from the frame index, so layer start/stop
+        // boundaries land exactly on the configured frames.
+        const fromClipTime = frame.fromClipFrame / fps;
 
         if (logTimes) console.time("Read frameSource1");
-        const newFrameSource1Data = await frameSource1.readNextFrame({ time: fromClipTime });
+        const newFrameSource1Data = await frameSource1!.readNextFrame({ time: fromClipTime });
         if (logTimes) console.timeEnd("Read frameSource1");
         // If we got no data, use the old data
         // TODO maybe abort?
         if (newFrameSource1Data) frameSource1Data = newFrameSource1Data;
         else console.warn("No frame data returned, using last frame");
 
-        const isInTransition =
-          frameSource2 && transitionNumFramesSafe > 0 && transitionFrameAt >= 0;
+        const isInTransition = frame.toClipIndex != null && frameSource2 != null;
 
         let outFrameData;
 
-        if (isInTransition) {
+        if (isInTransition && frameSource2) {
+          const toClipTime = frame.toClipFrame! / fps;
+
           if (logTimes) console.time("Read frameSource2");
           const frameSource2Data = await frameSource2.readNextFrame({ time: toClipTime });
           if (logTimes) console.timeEnd("Read frameSource2");
 
           if (frameSource2Data) {
-            const progress = transitionFrameAt / transitionNumFramesSafe;
+            const progress = frame.toClipFrame! / frame.transitionNumFrames;
+
+            if (!runTransitionOnFrame)
+              runTransitionOnFrame = currentTransition.create({ width, height, channels });
 
             if (logTimes) console.time("runTransitionOnFrame");
 
@@ -415,11 +411,11 @@ async function Editly(input: ConfigurationOptions): Promise<void> {
               "Writing frame:",
               totalFramesWritten,
               "from clip",
-              transitionFromClipId,
-              `(frame ${fromClipFrameAt})`,
+              currentClipIndex,
+              `(frame ${frame.fromClipFrame})`,
               "to clip",
-              getTransitionToClipId(),
-              `(frame ${toClipFrameAt} / ${transitionNumFramesSafe})`,
+              frame.toClipIndex,
+              `(frame ${frame.toClipFrame} / ${frame.transitionNumFrames})`,
               currentTransition.name,
               `${currentTransition.duration}s`,
             );
@@ -428,8 +424,8 @@ async function Editly(input: ConfigurationOptions): Promise<void> {
               "Writing frame:",
               totalFramesWritten,
               "from clip",
-              transitionFromClipId,
-              `(frame ${fromClipFrameAt})`,
+              currentClipIndex,
+              `(frame ${frame.fromClipFrame})`,
             );
           // console.log(outFrameData.length / 1e6, 'MB');
         }
@@ -446,9 +442,9 @@ async function Editly(input: ConfigurationOptions): Promise<void> {
         if (outProcessError) break;
 
         totalFramesWritten += 1;
-        fromClipFrameAt += 1;
-        if (isInTransition) toClipFrameAt += 1;
-      } // End while loop
+      } // End frame schedule loop
+
+      console.log("No more frames, done");
 
       outProcess.stdin?.end();
     } catch (err) {
@@ -478,7 +474,6 @@ async function Editly(input: ConfigurationOptions): Promise<void> {
 
 /**
  * Pure function to get a frame at a certain time.
- * TODO: I think this does not respect transition durations
  *
  * @param config - ConfigurationOptions.
  */
@@ -508,9 +503,17 @@ export async function renderSingleFrame(input: RenderSingleFrameConfig): Promise
     defaults,
   });
   let clipStartTime = 0;
-  const clip = clips.find((c) => {
-    if (clipStartTime <= time && clipStartTime + c.duration > time) return true;
-    clipStartTime += c.duration;
+  const clip = clips.find((c, i) => {
+    if (clipStartTime <= time && time < clipStartTime + c.duration) return true;
+    // The transition overlaps the end of this clip with the start of the next one,
+    // so the next clip starts earlier by the transition duration.
+    clipStartTime +=
+      c.duration -
+      getSafeTransitionDuration({
+        transitionDuration: c.transition.duration,
+        clipDuration: c.duration,
+        nextClipDuration: clips[i + 1]?.duration,
+      });
     return false;
   });
   assert(clip, "No clip found at requested time");

@@ -58,7 +58,9 @@ export class FrameSource<T extends BaseLayer> {
 
     const offsetTime = time - (start ?? 0);
     const offsetProgress = offsetTime / layerDuration!;
-    const shouldDrawLayer = offsetProgress >= 0 && offsetProgress <= 1;
+    // Layers are drawn on the half-open interval [start, stop): the frame that lands
+    // exactly on `stop` already belongs to the next layer, so the upper bound is exclusive.
+    const shouldDrawLayer = offsetProgress >= 0 && offsetProgress < 1;
 
     // Skip drawing if the layer has not started or has already ended
     if (!shouldDrawLayer) return;

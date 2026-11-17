@@ -27,6 +27,16 @@ export type ProcessedClip = {
   transition: Transition;
 };
 
+/**
+ * A "detached-audio" layer, collected with the index of the clip it belongs to.
+ * Its `start` is relative to the clip's start; the caller is responsible for
+ * placing it on the final (frame-exact) timeline once the fps is known.
+ */
+export type DetachedAudio = {
+  clipIndex: number;
+  track: AudioTrack;
+};
+
 // Cache
 const loadedFonts: string[] = [];
 
@@ -119,7 +129,7 @@ export default async function parseConfig({
 
   const detachedAudioByClip: Record<number, AudioTrack[]> = {};
 
-  let clipsOut: ProcessedClip[] = await pMap(
+  const clipsOut: ProcessedClip[] = await pMap(
     clips,
     async (clip, clipIndex) => {
       const { layers } = clip;
@@ -258,35 +268,15 @@ export default async function parseConfig({
     { concurrency: 1 },
   );
 
-  let totalClipDuration = 0;
-  const clipDetachedAudio: AudioTrack[] = [];
-
-  // Need to map again because now we know all clip durations, and we can adjust transitions so they are safe
-  clipsOut = await pMap(clipsOut, async (clip, i) => {
-    const nextClip = clipsOut[i + 1];
-
-    // We clamp all transitions to half the length of every clip. If not, we risk that clips that are too short,
-    // will be eaten by transitions and could cause de-sync issues with audio/video
-    // NOTE: similar logic is duplicated in index.js
-    let safeTransitionDuration = 0;
-    if (nextClip) {
-      // Each clip can have two transitions, make sure we leave enough room:
-      safeTransitionDuration = Math.min(
-        clip.duration / 2,
-        nextClip.duration / 2,
-        clip.transition!.duration!,
-      );
+  // Detached audio tracks run relative to their parent clip's start time. The actual
+  // offset on the output timeline can only be computed once the fps is known and the
+  // transitions have been quantized to whole frames, so we just collect them here and
+  // let the caller place them on the final timeline (see `computeTimeline`).
+  const detachedAudio: DetachedAudio[] = [];
+  clipsOut.forEach((_, clipIndex) => {
+    for (const track of detachedAudioByClip[clipIndex] || []) {
+      detachedAudio.push({ clipIndex, track });
     }
-
-    // We now know all clip durations so we can calculate the offset for detached audio tracks
-    for (const { start, ...rest } of detachedAudioByClip[i] || []) {
-      clipDetachedAudio.push({ ...rest, start: totalClipDuration + (start || 0) });
-    }
-
-    totalClipDuration += clip.duration - safeTransitionDuration;
-    clip.transition.duration = safeTransitionDuration;
-
-    return clip;
   });
 
   // Audio can either come from `audioFilePath`, `audio` or from "detached" audio layers from clips
@@ -302,13 +292,16 @@ export default async function parseConfig({
         ]
       : []),
     ...arbitraryAudioIn,
-    ...clipDetachedAudio,
   ];
 
-  await validateArbitraryAudio(arbitraryAudio, allowRemoteRequests);
+  await validateArbitraryAudio(
+    [...arbitraryAudio, ...detachedAudio.map(({ track }) => track)],
+    allowRemoteRequests,
+  );
 
   return {
     clips: clipsOut,
     arbitraryAudio,
+    detachedAudio,
   };
 }
