@@ -1,8 +1,16 @@
-import { flatMap } from "lodash-es";
 import pMap from "p-map";
 import { basename, join, resolve } from "path";
 import type { Configuration } from "./configuration.js";
-import { ffmpeg, getCutFromArgs, readFileStreams } from "./ffmpeg.js";
+import { ffmpeg, readFileStreams } from "./ffmpeg.js";
+import {
+  buildAmixArgs,
+  buildCrossFadeConcatArgs,
+  buildExtractAudioArgs,
+  buildMixArbitraryAudioArgs,
+  buildSilenceAudioArgs,
+  calcAtempo,
+  isAtempoInRange,
+} from "./ffmpegCommandBuilder.js";
 import type { TransitionOptions } from "./transition.js";
 import type {
   AudioLayer,
@@ -44,23 +52,7 @@ export default ({ verbose, tmpDir }: AudioOptions) => {
 
           async function createSilence() {
             if (verbose) console.log("create silence", duration);
-            const args = [
-              "-nostdin",
-              "-f",
-              "lavfi",
-              "-i",
-              "anullsrc=channel_layout=stereo:sample_rate=44100",
-              "-sample_fmt",
-              "s32",
-              "-ar",
-              "48000",
-              "-t",
-              duration!.toString(),
-              "-c:a",
-              "flac",
-              "-y",
-              clipAudioPath,
-            ];
+            const args = buildSilenceAudioArgs({ duration: duration!, outPath: clipAudioPath });
             await ffmpeg(args);
 
             return { silent: true, clipAudioPath };
@@ -91,11 +83,11 @@ export default ({ verbose, tmpDir }: AudioOptions) => {
               const layerAudioPath = join(tmpDir, `clip${i}-layer${j}-audio.flac`);
 
               try {
+                const atempo = calcAtempo(speedFactor);
                 let atempoFilter;
-                if (Math.abs(speedFactor - 1) > 0.01) {
+                if (atempo !== undefined) {
                   if (verbose) console.log("audio speedFactor", speedFactor);
-                  const atempo = 1 / speedFactor;
-                  if (!(atempo >= 0.5 && atempo <= 100)) {
+                  if (!isAtempoInRange(atempo)) {
                     // Required range by ffmpeg
                     console.warn(
                       `Audio speed ${atempo} is outside accepted range, using silence (clip ${i})`,
@@ -105,27 +97,14 @@ export default ({ verbose, tmpDir }: AudioOptions) => {
                   atempoFilter = `atempo=${atempo}`;
                 }
 
-                const cutToArg = (cutTo! - cutFrom!) * speedFactor;
-
-                const args = [
-                  "-nostdin",
-                  ...getCutFromArgs({ cutFrom }),
-                  "-i",
+                const args = buildExtractAudioArgs({
                   path,
-                  "-t",
-                  cutToArg!.toString(),
-                  "-sample_fmt",
-                  "s32",
-                  "-ar",
-                  "48000",
-                  "-map",
-                  "a:0",
-                  "-c:a",
-                  "flac",
-                  ...(atempoFilter ? ["-filter:a", atempoFilter] : []),
-                  "-y",
-                  layerAudioPath,
-                ];
+                  cutFrom: cutFrom!,
+                  cutTo: cutTo!,
+                  speedFactor,
+                  atempoFilter,
+                  outPath: layerAudioPath,
+                });
 
                 await ffmpeg(args);
 
@@ -150,16 +129,11 @@ export default ({ verbose, tmpDir }: AudioOptions) => {
 
           // Merge/mix all layers' audio
           const weights = processedAudioLayers.map(([, { mixVolume }]) => mixVolume ?? 1);
-          const args = [
-            "-nostdin",
-            ...flatMap(processedAudioLayers, ([layerAudioPath]) => ["-i", layerAudioPath]),
-            "-filter_complex",
-            `amix=inputs=${processedAudioLayers.length}:duration=longest:weights=${weights.join(" ")}`,
-            "-c:a",
-            "flac",
-            "-y",
-            clipAudioPath,
-          ];
+          const args = buildAmixArgs({
+            inputPaths: processedAudioLayers.map(([layerAudioPath]) => layerAudioPath),
+            weights,
+            outPath: clipAudioPath,
+          });
 
           await ffmpeg(args);
           return { clipAudioPath, silent: false };
@@ -192,32 +166,7 @@ export default ({ verbose, tmpDir }: AudioOptions) => {
         clipAudio.map(({ path }) => basename(path)),
       );
 
-    let inStream = "[0:a]";
-    const filterGraph = clipAudio
-      .slice(0, -1)
-      .map(({ transition }, i) => {
-        const outStream = `[concat${i}]`;
-
-        const epsilon = 0.0001; // If duration is 0, ffmpeg seems to default to 1 sec instead, hence epsilon.
-        let ret = `${inStream}[${i + 1}:a]acrossfade=d=${Math.max(epsilon, transition?.duration ?? 0)}:c1=${transition?.audioOutCurve ?? "tri"}:c2=${transition?.audioInCurve ?? "tri"}`;
-
-        inStream = outStream;
-
-        if (i < clipAudio.length - 2) ret += outStream;
-        return ret;
-      })
-      .join(",");
-
-    const args = [
-      "-nostdin",
-      ...flatMap(clipAudio, ({ path }) => ["-i", path]),
-      "-filter_complex",
-      filterGraph,
-      "-c",
-      "flac",
-      "-y",
-      outPath,
-    ];
+    const args = buildCrossFadeConcatArgs({ clipAudio, outPath });
     await ffmpeg(args);
 
     return outPath;
@@ -233,41 +182,14 @@ export default ({ verbose, tmpDir }: AudioOptions) => {
     audioNorm?: AudioNormalizationOptions;
     outputVolume?: number | string;
   }) {
-    let maxGain = 30;
-    let gaussSize = 5;
-    if (audioNorm) {
-      if (audioNorm.gaussSize != null) gaussSize = audioNorm.gaussSize;
-      if (audioNorm.maxGain != null) maxGain = audioNorm.maxGain;
-    }
-    const enableAudioNorm = audioNorm && audioNorm.enable;
-
-    // https://stackoverflow.com/questions/35509147/ffmpeg-amix-filter-volume-issue-with-inputs-of-different-duration
-    let filterComplex = streams
-      .map(({ start, cutFrom, cutTo }, i) => {
-        const cutToArg = cutTo != null ? `:end=${cutTo}` : "";
-        const apadArg = i > 0 ? ",apad" : ""; // Don't pad the first track (audio from video clips with correct duration)
-
-        return `[${i}:a]atrim=start=${cutFrom || 0}${cutToArg},adelay=delays=${Math.floor((start || 0) * 1000)}:all=1${apadArg}[a${i}]`;
-      })
-      .join(";");
-
-    const volumeArg = outputVolume != null ? `,volume=${outputVolume}` : "";
-    const audioNormArg = enableAudioNorm ? `,dynaudnorm=g=${gaussSize}:maxgain=${maxGain}` : "";
-    filterComplex += `;${streams.map((_, i) => `[a${i}]`).join("")}amix=inputs=${streams.length}:duration=first:dropout_transition=0:weights=${streams.map((s) => (s.mixVolume != null ? s.mixVolume : 1)).join(" ")}${audioNormArg}${volumeArg}`;
-
     const mixedAudioPath = join(tmpDir, "audio-mixed.flac");
 
-    const args = [
-      "-nostdin",
-      ...flatMap(streams, ({ path, loop }) => ["-stream_loop", (loop || 0).toString(), "-i", path]),
-      "-vn",
-      "-filter_complex",
-      filterComplex,
-      "-c:a",
-      "flac",
-      "-y",
-      mixedAudioPath,
-    ];
+    const args = buildMixArbitraryAudioArgs({
+      streams,
+      audioNorm,
+      outputVolume,
+      outPath: mixedAudioPath,
+    });
 
     await ffmpeg(args);
 

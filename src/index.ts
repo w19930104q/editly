@@ -6,6 +6,7 @@ import JSON5 from "json5";
 import Audio from "./audio.js";
 import { Configuration, type ConfigurationOptions } from "./configuration.js";
 import { configureFf, ffmpeg, parseFps } from "./ffmpeg.js";
+import { buildOutputArgs, buildWriterArgs } from "./ffmpegCommandBuilder.js";
 import { createFrameSource } from "./frameSource.js";
 import parseConfig, { ProcessedClip } from "./parseConfig.js";
 import { createFabricCanvas, rgbaToFabricImage } from "./sources/fabric.js";
@@ -188,64 +189,27 @@ async function Editly(input: ConfigurationOptions): Promise<void> {
     }, 0);
 
   function getOutputArgs() {
-    if (customOutputArgs) {
-      assert(Array.isArray(customOutputArgs), "customOutputArgs must be an array of arguments");
-      return customOutputArgs;
-    }
-
-    // https://superuser.com/questions/556029/how-do-i-convert-a-video-to-gif-using-ffmpeg-with-reasonable-quality
-    const videoOutputArgs = isGif
-      ? [
-          "-vf",
-          `format=rgb24,fps=${fps},scale=${width}:${height}:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse`,
-          "-loop",
-          "0",
-        ]
-      : [
-          "-vf",
-          "format=yuv420p",
-          "-vcodec",
-          "libx264",
-          "-profile:v",
-          "high",
-          ...(fast ? ["-preset:v", "ultrafast"] : ["-preset:v", "medium"]),
-          "-crf",
-          "18",
-
-          "-movflags",
-          "faststart",
-        ];
-
-    const audioOutputArgs = audioFilePath ? ["-acodec", "aac", "-b:a", "128k"] : [];
-
-    return [...audioOutputArgs, ...videoOutputArgs];
+    return buildOutputArgs({
+      customOutputArgs,
+      isGif,
+      fps,
+      width,
+      height,
+      fast,
+      hasAudio: !!audioFilePath,
+    });
   }
 
   function startFfmpegWriterProcess() {
-    const args = [
-      "-f",
-      "rawvideo",
-      "-vcodec",
-      "rawvideo",
-      "-pix_fmt",
-      "rgba",
-      "-s",
-      `${width}x${height}`,
-      "-r",
+    const args = buildWriterArgs({
+      width,
+      height,
       framerateStr,
-      "-i",
-      "-",
-
-      ...(audioFilePath ? ["-i", audioFilePath] : []),
-
-      ...(!isGif ? ["-map", "0:v:0"] : []),
-      ...(audioFilePath ? ["-map", "1:a:0"] : []),
-
-      ...getOutputArgs(),
-
-      "-y",
+      audioFilePath,
+      isGif,
+      outputArgs: getOutputArgs(),
       outPath,
-    ];
+    });
     return ffmpeg(args, {
       encoding: "buffer",
       buffer: false,

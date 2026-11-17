@@ -3,6 +3,11 @@ import { compareVersions } from "compare-versions";
 import { execa, type Options } from "execa";
 import fsExtra from "fs-extra";
 import { FfmpegConfig } from "./configuration.js";
+import { getFfmpegCommonArgs as buildFfmpegCommonArgs } from "./ffmpegCommandBuilder.js";
+
+// Pure command builders live in ffmpegCommandBuilder.ts; re-exported here
+// so existing imports keep working.
+export { getCutFromArgs, getCutToArgs } from "./ffmpegCommandBuilder.js";
 
 export type Stream = {
   codec_type: string;
@@ -25,23 +30,7 @@ const config: Required<FfmpegConfig> = {
 };
 
 export function getFfmpegCommonArgs() {
-  return ["-hide_banner", ...(config.enableFfmpegLog ? [] : ["-loglevel", "error"])];
-}
-
-export function getCutFromArgs({ cutFrom }: { cutFrom?: number }) {
-  return cutFrom ? ["-ss", cutFrom.toString()] : [];
-}
-
-export function getCutToArgs({
-  cutTo,
-  cutFrom,
-  speedFactor,
-}: {
-  cutTo?: number;
-  cutFrom?: number;
-  speedFactor: number;
-}) {
-  return cutFrom && cutTo ? ["-t", (cutTo - cutFrom) * speedFactor] : [];
+  return buildFfmpegCommonArgs({ enableFfmpegLog: config.enableFfmpegLog });
 }
 
 export async function createConcatFile(segments: string[], concatFilePath: string) {

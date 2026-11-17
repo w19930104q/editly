@@ -2,6 +2,11 @@ import { ExecaError } from "execa";
 import * as fabric from "fabric/node";
 import { defineFrameSource } from "../api/index.js";
 import { ffmpeg, readFileStreams } from "../ffmpeg.js";
+import {
+  buildScaleFilter,
+  buildVideoFrameSourceArgs,
+  getVideoInputCodec,
+} from "../ffmpegCommandBuilder.js";
 import { rawVideoToFrames } from "../transforms/rawVideoToFrames.js";
 import type { VideoLayer } from "../types.js";
 import { blurImage, rgbaToFabricImage } from "./fabric.js";
@@ -44,82 +49,37 @@ export default defineFrameSource<VideoLayer>("video", async (options) => {
   const left = leftRel * canvasWidth;
   const top = topRel * canvasHeight;
 
-  const ratioW = requestedWidth / inputWidth!;
-  const ratioH = requestedHeight / inputHeight!;
-  const inputAspectRatio = inputWidth! / inputHeight!;
-
-  let targetWidth = requestedWidth;
-  let targetHeight = requestedHeight;
-
-  let scaleFilter;
-  if (["contain", "contain-blur"].includes(resizeMode)) {
-    if (ratioW > ratioH) {
-      targetHeight = requestedHeight;
-      targetWidth = Math.round(requestedHeight * inputAspectRatio);
-    } else {
-      targetWidth = requestedWidth;
-      targetHeight = Math.round(requestedWidth / inputAspectRatio);
-    }
-
-    scaleFilter = `scale=${targetWidth}:${targetHeight}`;
-  } else if (resizeMode === "cover") {
-    let scaledWidth;
-    let scaledHeight;
-
-    if (ratioW > ratioH) {
-      scaledWidth = requestedWidth;
-      scaledHeight = Math.round(requestedWidth / inputAspectRatio);
-    } else {
-      scaledHeight = requestedHeight;
-      scaledWidth = Math.round(requestedHeight * inputAspectRatio);
-    }
-
-    // TODO improve performance by crop first, then scale?
-    scaleFilter = `scale=${scaledWidth}:${scaledHeight},crop=${targetWidth}:${targetHeight}`;
-  } else {
-    // 'stretch'
-    scaleFilter = `scale=${targetWidth}:${targetHeight}`;
-  }
+  const { scaleFilter, targetWidth, targetHeight } = buildScaleFilter({
+    resizeMode,
+    requestedWidth,
+    requestedHeight,
+    inputWidth: inputWidth!,
+    inputHeight: inputHeight!,
+  });
 
   if (verbose) console.log(scaleFilter);
 
-  let ptsFilter = "";
-  if (speedFactor !== 1) {
-    if (verbose) console.log("speedFactor", speedFactor);
-    ptsFilter = `setpts=${speedFactor}*PTS,`;
-  }
+  if (speedFactor !== 1 && verbose) console.log("speedFactor", speedFactor);
 
   // https://forum.unity.com/threads/settings-for-importing-a-video-with-an-alpha-channel.457657/
   const streams = await readFileStreams(path);
   const firstVideoStream = streams.find((s) => s.codec_type === "video");
   // https://superuser.com/a/1116905/658247
 
-  let inputCodec;
-  if (firstVideoStream?.codec_name === "vp8") inputCodec = "libvpx";
-  else if (firstVideoStream?.codec_name === "vp9") inputCodec = "libvpx-vp9";
+  const inputCodec = getVideoInputCodec(firstVideoStream?.codec_name);
 
   // http://zulko.github.io/blog/2013/09/27/read-and-write-video-frames-in-python-using-ffmpeg/
   // Testing: ffmpeg -i 'vid.mov' -t 1 -vcodec rawvideo -pix_fmt rgba -f image2pipe - | ffmpeg -f rawvideo -vcodec rawvideo -pix_fmt rgba -s 2166x1650 -i - -vf format=yuv420p -vcodec libx264 -y out.mp4
   // https://trac.ffmpeg.org/wiki/ChangingFrameRate
-  const args = [
-    "-nostdin",
-    ...(inputCodec ? ["-vcodec", inputCodec] : []),
-    ...(cutFrom ? ["-ss", cutFrom.toString()] : []),
-    "-i",
+  const args = buildVideoFrameSourceArgs({
     path,
-    ...(cutTo ? ["-t", ((cutTo - cutFrom!) * speedFactor!).toString()] : []),
-    "-vf",
-    `${ptsFilter}fps=${framerateStr},${scaleFilter}`,
-    "-map",
-    "v:0",
-    "-vcodec",
-    "rawvideo",
-    "-pix_fmt",
-    "rgba",
-    "-f",
-    "image2pipe",
-    "-",
-  ];
+    inputCodec,
+    cutFrom,
+    cutTo,
+    speedFactor: speedFactor!,
+    framerateStr,
+    scaleFilter,
+  });
 
   const controller = new AbortController();
   const transform = rawVideoToFrames({
